@@ -3,7 +3,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import random
-from pymongo import MongoClient
+import psycopg2
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -15,12 +15,24 @@ class MyBot(commands.Bot):
 
 bot = MyBot()
 
-# --- БАЗА ДАННЫХ MONGODB ---
-# Получаем секретную ссылку из настроек хостинга
-MONGO_URL = os.getenv('MONGO_URL')
-cluster = MongoClient(MONGO_URL)
-db = cluster["barbot_database"] # Создаем базу данных
-users_collection = db["users"] # Создаем "таблицу" (коллекцию) пользователей
+# --- БАЗА ДАННЫХ POSTGRESQL (NEON) ---
+# Получаем ссылку на базу данных из настроек хостинга
+DATABASE_URL = os.getenv('DATABASE_URL')
+
+# Подключаемся к облачной БД
+conn = psycopg2.connect(DATABASE_URL)
+conn.autocommit = True # Автоматическое сохранение изменений
+cursor = conn.cursor()
+
+# Создаем таблицу users (BIGINT нужен, так как ID в дискорде очень длинные)
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT,
+        guild_id BIGINT,
+        liters REAL,
+        UNIQUE(user_id, guild_id)
+    )
+''')
 
 DRINKS = [
     "🍺 Светлое нефильтрованное", "🍻 Темный ирландский стаут",
@@ -31,16 +43,18 @@ DRINKS = [
 
 # --- КОМАНДА /DRINK ---
 @bot.tree.command(name="drink", description="Выпить алкоголь в баре")
-#@app_commands.checks.cooldown(1, 3600.0, key=lambda i: (i.guild_id, i.user.id))
+# Кулдаун временно отключен для тестов. Чтобы включить, убери решетку ниже:
+# @app_commands.checks.cooldown(1, 3600.0, key=lambda i: (i.guild_id, i.user.id))
 async def drink(interaction: discord.Interaction):
     user_id = interaction.user.id
     guild_id = interaction.guild_id
     
     drink_choice = random.choice(DRINKS)
     
-    # Ищем пользователя в MongoDB
-    user_data = users_collection.find_one({"user_id": user_id, "guild_id": guild_id})
-    current_liters = user_data["liters"] if user_data else 0.0
+    # Ищем пользователя в PostgreSQL (используем %s вместо ?)
+    cursor.execute("SELECT liters FROM users WHERE user_id = %s AND guild_id = %s", (user_id, guild_id))
+    result = cursor.fetchone()
+    current_liters = result[0] if result else 0.0
     
     if current_liters < 5.0: added_liters = random.uniform(0.3, 0.5)
     elif current_liters < 15.0: added_liters = random.uniform(0.5, 1.0)
@@ -51,37 +65,32 @@ async def drink(interaction: discord.Interaction):
     new_total = round(current_liters + added_liters, 2)
     
     # Обновляем или добавляем данные
-    if user_data is None:
-        users_collection.insert_one({"user_id": user_id, "guild_id": guild_id, "liters": new_total})
+    if result is None:
+        cursor.execute("INSERT INTO users (user_id, guild_id, liters) VALUES (%s, %s, %s)", (user_id, guild_id, new_total))
     else:
-        users_collection.update_one({"user_id": user_id, "guild_id": guild_id}, {"$set": {"liters": new_total}})
+        cursor.execute("UPDATE users SET liters = %s WHERE user_id = %s AND guild_id = %s", (new_total, user_id, guild_id))
     
-    await interaction.response.send_message(f"**{interaction.user.name}** заказывает у бармена {drink_choice} и выпивает залпом **{added_liters} л.**! 🥂\n*(Всего выпито: {new_total} л.)*")
+    await interaction.response.send_message(f"**{interaction.user.name}** {drink_choice} выпивает залпом **{added_liters} л.**! 🥂\n*(Всего выпито: {new_total} л.)*")
 
 @drink.error
 async def drink_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CommandOnCooldown):
         minutes = int(error.retry_after / 60)
-        await interaction.response.send_message(f"🛑 Твоя печень просит пощады! Приходи к барной стойке через {minutes} минут.", ephemeral=True)
-
+        await interaction.response.send_message(f"🛑 Приходи через {minutes} минут.", ephemeral=True)
 
 # --- КОМАНДА /LEADERBOARD ---
-@bot.tree.command(name="leaderboard", description="Показать список главных алко-баронов сервера")
+@bot.tree.command(name="leaderboard", description="Показать список лидеров сервера")
 async def leaderboard(interaction: discord.Interaction):
-    # Достаем топ-10 пользователей из MongoDB и сортируем по убыванию
-    top_users = users_collection.find({"guild_id": interaction.guild_id}).sort("liters", -1).limit(10)
-    top_users_list = list(top_users)
+    cursor.execute("SELECT user_id, liters FROM users WHERE guild_id = %s ORDER BY liters DESC LIMIT 10", (interaction.guild_id,))
+    top_users_list = cursor.fetchall()
     
     if not top_users_list:
-        await interaction.response.send_message("🍺 В этом баре еще никто не пил! Будь первым, используй /drink")
+        await interaction.response.send_message("🍺Будь первым, используй /drink")
         return
 
-    embed = discord.Embed(title="🏆 Топ посетителей бара", description="Самые стойкие участники нашего сервера:", color=discord.Color.gold())
+    embed = discord.Embed(title="🏆 Топ", description="Самые стойкие участники нашего сервера:", color=discord.Color.gold())
 
-    for index, user_data in enumerate(top_users_list, 1):
-        uid = user_data["user_id"]
-        liters_count = user_data["liters"]
-        
+    for index, (uid, liters_count) in enumerate(top_users_list, 1):
         if index == 1: medal = "🥇"
         elif index == 2: medal = "🥈"
         elif index == 3: medal = "🥉"
@@ -91,24 +100,24 @@ async def leaderboard(interaction: discord.Interaction):
         
     await interaction.response.send_message(embed=embed)
 
-
 # --- КОМАНДА /STATS ---
-@bot.tree.command(name="stats", description="Посмотреть свою личную статистику в баре")
+@bot.tree.command(name="stats", description="Посмотреть свою личную статистику")
 async def stats(interaction: discord.Interaction):
     user_id = interaction.user.id
     guild_id = interaction.guild_id
     
-    user_data = users_collection.find_one({"user_id": user_id, "guild_id": guild_id})
-    liters_count = user_data["liters"] if user_data else 0.0
+    cursor.execute("SELECT liters FROM users WHERE user_id = %s AND guild_id = %s", (user_id, guild_id))
+    result = cursor.fetchone()
+    liters_count = result[0] if result else 0.0
     
     embed = discord.Embed(title=f"📊 Барная карта: {interaction.user.name}", color=discord.Color.blue())
     if interaction.user.avatar: embed.set_thumbnail(url=interaction.user.avatar.url)
         
     if liters_count == 0: status = "Трезвенник 🥱"
-    elif liters_count < 5.0: status = "Новичок в баре 🥂"
+    elif liters_count < 5.0: status = "Школота 🥂"
     elif liters_count < 15.0: status = "Любитель тусовок 🍺"
-    elif liters_count < 30.0: status = "Завсегдатай клуба 🥃"
-    else: status = "Легенда этого заведения 👑"
+    elif liters_count < 30.0: status = "Алкашня 🥃"
+    else: status = "Легенда 👑"
         
     embed.add_field(name="Выпито алкоголя:", value=f"**{liters_count} л.**", inline=True)
     embed.add_field(name="Твой статус:", value=f"*{status}*", inline=True)
