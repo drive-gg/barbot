@@ -1,9 +1,9 @@
+import os
 import discord
 from discord.ext import commands
 from discord import app_commands
-import sqlite3
 import random
-import os
+from pymongo import MongoClient
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -15,13 +15,12 @@ class MyBot(commands.Bot):
 
 bot = MyBot()
 
-# --- БАЗА ДАННЫХ ---
-conn = sqlite3.connect('bar.db')
-cursor = conn.cursor()
-# Теперь сохраняем литры в формате REAL (числа с плавающей точкой)
-cursor.execute('''CREATE TABLE IF NOT EXISTS users 
-                  (user_id INTEGER, guild_id INTEGER, liters REAL)''')
-conn.commit()
+# --- БАЗА ДАННЫХ MONGODB ---
+# Получаем секретную ссылку из настроек хостинга
+MONGO_URL = os.getenv('MONGO_URL')
+cluster = MongoClient(MONGO_URL)
+db = cluster["barbot_database"] # Создаем базу данных
+users_collection = db["users"] # Создаем "таблицу" (коллекцию) пользователей
 
 DRINKS = [
     "🍺 Светлое нефильтрованное", "🍻 Темный ирландский стаут",
@@ -31,7 +30,7 @@ DRINKS = [
 ]
 
 # --- КОМАНДА /DRINK ---
-@bot.tree.command(name="drink", description="Выпить алкоголь")
+@bot.tree.command(name="drink", description="Выпить алкоголь в баре")
 @app_commands.checks.cooldown(1, 3600.0, key=lambda i: (i.guild_id, i.user.id))
 async def drink(interaction: discord.Interaction):
     user_id = interaction.user.id
@@ -39,118 +38,85 @@ async def drink(interaction: discord.Interaction):
     
     drink_choice = random.choice(DRINKS)
     
-    # Узнаем, сколько пользователь УЖЕ выпил
-    cursor.execute("SELECT liters FROM users WHERE user_id=? AND guild_id=?", (user_id, guild_id))
-    result = cursor.fetchone()
-    current_liters = result[0] if result is not None else 0.0
+    # Ищем пользователя в MongoDB
+    user_data = users_collection.find_one({"user_id": user_id, "guild_id": guild_id})
+    current_liters = user_data["liters"] if user_data else 0.0
     
-    # Определяем, сколько литров он выпьет СЕЙЧАС, в зависимости от его текущего статуса
-    if current_liters < 5.0:
-        added_liters = random.uniform(0.3, 0.5) # Новичок пьет мало
-    elif current_liters < 15.0:
-        added_liters = random.uniform(0.5, 1.0) # Любитель пьет больше
-    elif current_liters < 30.0:
-        added_liters = random.uniform(1.0, 2.0) # Завсегдатай
-    else:
-        added_liters = random.uniform(2.0, 4.0) # Легенда пьет литрами
+    if current_liters < 5.0: added_liters = random.uniform(0.3, 0.5)
+    elif current_liters < 15.0: added_liters = random.uniform(0.5, 1.0)
+    elif current_liters < 30.0: added_liters = random.uniform(1.0, 2.0)
+    else: added_liters = random.uniform(2.0, 4.0)
         
-    # Округляем до двух знаков после запятой (например, 0.45)
     added_liters = round(added_liters, 2)
     new_total = round(current_liters + added_liters, 2)
     
-    # Сохраняем в базу данных
-    if result is None:
-        cursor.execute("INSERT INTO users VALUES (?, ?, ?)", (user_id, guild_id, new_total))
+    # Обновляем или добавляем данные
+    if user_data is None:
+        users_collection.insert_one({"user_id": user_id, "guild_id": guild_id, "liters": new_total})
     else:
-        cursor.execute("UPDATE users SET liters=? WHERE user_id=? AND guild_id=?", (new_total, user_id, guild_id))
-    conn.commit()
+        users_collection.update_one({"user_id": user_id, "guild_id": guild_id}, {"$set": {"liters": new_total}})
     
-    await interaction.response.send_message(f"**{interaction.user.name}** {drink_choice} выпивает залпом **{added_liters} л.**! 🥂\n*(Всего выпито: {new_total} л.)*")
+    await interaction.response.send_message(f"**{interaction.user.name}** заказывает у бармена {drink_choice} и выпивает залпом **{added_liters} л.**! 🥂\n*(Всего выпито: {new_total} л.)*")
 
 @drink.error
 async def drink_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CommandOnCooldown):
         minutes = int(error.retry_after / 60)
-        await interaction.response.send_message(f"🛑 Приходи через {minutes} минут.", ephemeral=True)
+        await interaction.response.send_message(f"🛑 Твоя печень просит пощады! Приходи к барной стойке через {minutes} минут.", ephemeral=True)
 
 
 # --- КОМАНДА /LEADERBOARD ---
-@bot.tree.command(name="leaderboard", description="Показать топ сервера")
+@bot.tree.command(name="leaderboard", description="Показать список главных алко-баронов сервера")
 async def leaderboard(interaction: discord.Interaction):
-    # Достаем топ-10 пользователей
-    cursor.execute("SELECT user_id, liters FROM users WHERE guild_id=? ORDER BY liters DESC LIMIT 10", (interaction.guild_id,))
-    top_users = cursor.fetchall()
+    # Достаем топ-10 пользователей из MongoDB и сортируем по убыванию
+    top_users = users_collection.find({"guild_id": interaction.guild_id}).sort("liters", -1).limit(10)
+    top_users_list = list(top_users)
     
-    if not top_users:
-        await interaction.response.send_message("🍺 Будь первым, используй /drink")
+    if not top_users_list:
+        await interaction.response.send_message("🍺 В этом баре еще никто не пил! Будь первым, используй /drink")
         return
 
-    embed = discord.Embed(
-        title="🏆 Топ",
-        description="Топ участников сервера:",
-        color=discord.Color.gold()
-    )
+    embed = discord.Embed(title="🏆 Топ посетителей бара", description="Самые стойкие участники нашего сервера:", color=discord.Color.gold())
 
-    for index, row in enumerate(top_users, 1):
-        user_id = row[0]
-        liters_count = row[1]
+    for index, user_data in enumerate(top_users_list, 1):
+        uid = user_data["user_id"]
+        liters_count = user_data["liters"]
         
         if index == 1: medal = "🥇"
         elif index == 2: medal = "🥈"
         elif index == 3: medal = "🥉"
         else: medal = "🍺"
             
-        # ИСПОЛЬЗУЕМ ПИНГ ПО ID <@user_id> ВМЕСТО ИМЕНИ, ЧТОБЫ ИЗБЕЖАТЬ "НЕИЗВЕСТНОГО"
-        embed.add_field(
-            name=f"{medal} {index} место", 
-            value=f"<@{user_id}> — **{liters_count} л.**", 
-            inline=False
-        )
+        embed.add_field(name=f"{medal} {index} место", value=f"<@{uid}> — **{liters_count} л.**", inline=False)
         
     await interaction.response.send_message(embed=embed)
 
 
 # --- КОМАНДА /STATS ---
-@bot.tree.command(name="stats", description="Посмотреть свою личную статистику")
+@bot.tree.command(name="stats", description="Посмотреть свою личную статистику в баре")
 async def stats(interaction: discord.Interaction):
     user_id = interaction.user.id
     guild_id = interaction.guild_id
     
-    cursor.execute("SELECT liters FROM users WHERE user_id=? AND guild_id=?", (user_id, guild_id))
-    result = cursor.fetchone()
+    user_data = users_collection.find_one({"user_id": user_id, "guild_id": guild_id})
+    liters_count = user_data["liters"] if user_data else 0.0
     
-    liters_count = result[0] if result is not None else 0.0
-    
-    embed = discord.Embed(
-        title=f"📊 Барная карта: {interaction.user.name}",
-        color=discord.Color.blue()
-    )
-    
-    if interaction.user.avatar:
-        embed.set_thumbnail(url=interaction.user.avatar.url)
+    embed = discord.Embed(title=f"📊 Барная карта: {interaction.user.name}", color=discord.Color.blue())
+    if interaction.user.avatar: embed.set_thumbnail(url=interaction.user.avatar.url)
         
-    # Считаем статусы отталкиваясь от литров
-    if liters_count == 0:
-        status = "Трезвенник 🥱"
-    elif liters_count < 5.0:
-        status = "Школота 🥂"
-    elif liters_count < 15.0:
-        status = "Любитель тусовок 🍺"
-    elif liters_count < 30.0:
-        status = "Алкашня 🥃"
-    else:
-        status = "Легенда 👑"
+    if liters_count == 0: status = "Трезвенник 🥱"
+    elif liters_count < 5.0: status = "Новичок в баре 🥂"
+    elif liters_count < 15.0: status = "Любитель тусовок 🍺"
+    elif liters_count < 30.0: status = "Завсегдатай клуба 🥃"
+    else: status = "Легенда этого заведения 👑"
         
     embed.add_field(name="Выпито алкоголя:", value=f"**{liters_count} л.**", inline=True)
     embed.add_field(name="Твой статус:", value=f"*{status}*", inline=True)
     
-    if liters_count == 0:
-        embed.set_footer(text="Используй /drink")
-    else:
-        embed.set_footer(text="Чем выше статус, тем больше литров ты пьешь за раз!")
+    if liters_count == 0: embed.set_footer(text="Бармен ждет твоего заказа! Используй /drink")
+    else: embed.set_footer(text="Чем выше статус, тем больше литров ты пьешь за раз!")
 
     await interaction.response.send_message(embed=embed)
 
-
-# ЗАПУСК БОТА
+# ЗАПУСК БОТА С ТОКЕНОМ ИЗ НАСТРОЕК
 bot.run(os.getenv('TOKEN'))
