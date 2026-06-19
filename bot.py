@@ -1,30 +1,22 @@
 import os
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import random
 import psycopg2
 
-class MyBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=discord.Intents.default())
-
-    async def setup_hook(self):
-        await self.tree.sync() 
-        print("Слеш-команды успешно синхронизированы!")
-
-bot = MyBot()
-
-# --- БАЗА ДАННЫХ POSTGRESQL (NEON) ---
-# Получаем ссылку на базу данных из настроек хостинга
+# --- ФУНКЦИЯ ПОДКЛЮЧЕНИЯ К БД ---
 DATABASE_URL = os.getenv('DATABASE_URL')
 
-# Подключаемся к облачной БД
-conn = psycopg2.connect(DATABASE_URL)
-conn.autocommit = True # Автоматическое сохранение изменений
-cursor = conn.cursor()
+def connect_to_db():
+    c = psycopg2.connect(DATABASE_URL)
+    c.autocommit = True
+    return c, c.cursor()
 
-# Создаем таблицу users (BIGINT нужен, так как ID в дискорде очень длинные)
+# Создаем первичное подключение
+conn, cursor = connect_to_db()
+
+# Создаем таблицу
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT,
@@ -34,6 +26,32 @@ cursor.execute('''
     )
 ''')
 
+class MyBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=discord.Intents.default())
+
+    async def setup_hook(self):
+        await self.tree.sync() 
+        self.keep_db_alive.start() # Запускаем наш "Пульс" при старте бота
+        print("Слеш-команды успешно синхронизированы и БД под контролем!")
+
+    # --- ТОТ САМЫЙ "ПУЛЬС" ---
+    # Каждые 3 минуты бот будет пинговать базу, чтобы она не уснула
+    @tasks.loop(minutes=3.0)
+    async def keep_db_alive(self):
+        global conn, cursor
+        try:
+            cursor.execute("SELECT 1") # Пустой запрос чисто для активности
+        except Exception as e:
+            print("Соединение с БД потеряно. Переподключаюсь...")
+            try:
+                conn, cursor = connect_to_db()
+                print("Успешное переподключение!")
+            except Exception as reconnect_error:
+                print(f"Ошибка переподключения: {reconnect_error}")
+
+bot = MyBot()
+
 DRINKS = [
     "🍺 Светлое нефильтрованное", "🍻 Темный ирландский стаут",
     "🍷 Бокал красного сухого", "🥃 Шот текилы с лимоном",
@@ -42,16 +60,19 @@ DRINKS = [
 ]
 
 # --- КОМАНДА /DRINK ---
-@bot.tree.command(name="drink", description="Выпить алкоголь в баре")
-# Кулдаун временно отключен для тестов. Чтобы включить, убери решетку ниже:
-@app_commands.checks.cooldown(1, 3600.0, key=lambda i: (i.guild_id, i.user.id))
+@bot.tree.command(name="drink", description="Выпить алкоголь")
+# @app_commands.checks.cooldown(1, 3600.0, key=lambda i: (i.guild_id, i.user.id))
 async def drink(interaction: discord.Interaction):
     user_id = interaction.user.id
     guild_id = interaction.guild_id
     
     drink_choice = random.choice(DRINKS)
     
-    # Ищем пользователя в PostgreSQL (используем %s вместо ?)
+    # Перед каждым запросом проверяем, живо ли соединение (на всякий случай)
+    global conn, cursor
+    if conn.closed != 0:
+        conn, cursor = connect_to_db()
+
     cursor.execute("SELECT liters FROM users WHERE user_id = %s AND guild_id = %s", (user_id, guild_id))
     result = cursor.fetchone()
     current_liters = result[0] if result else 0.0
@@ -64,7 +85,6 @@ async def drink(interaction: discord.Interaction):
     added_liters = round(added_liters, 2)
     new_total = round(current_liters + added_liters, 2)
     
-    # Обновляем или добавляем данные
     if result is None:
         cursor.execute("INSERT INTO users (user_id, guild_id, liters) VALUES (%s, %s, %s)", (user_id, guild_id, new_total))
     else:
@@ -79,16 +99,20 @@ async def drink_error(interaction: discord.Interaction, error: app_commands.AppC
         await interaction.response.send_message(f"🛑 Приходи через {minutes} минут.", ephemeral=True)
 
 # --- КОМАНДА /LEADERBOARD ---
-@bot.tree.command(name="leaderboard", description="Показать список лидеров сервера")
+@bot.tree.command(name="leaderboard", description="Показать список лидеров")
 async def leaderboard(interaction: discord.Interaction):
+    global conn, cursor
+    if conn.closed != 0:
+        conn, cursor = connect_to_db()
+
     cursor.execute("SELECT user_id, liters FROM users WHERE guild_id = %s ORDER BY liters DESC LIMIT 10", (interaction.guild_id,))
     top_users_list = cursor.fetchall()
     
     if not top_users_list:
-        await interaction.response.send_message("🍺Будь первым, используй /drink")
+        await interaction.response.send_message("🍺 Будь первым, используй /drink")
         return
 
-    embed = discord.Embed(title="🏆 Топ", description="Самые стойкие участники нашего сервера:", color=discord.Color.gold())
+    embed = discord.Embed(title="🏆 Топ посетителей бара", description="Самые стойкие участники нашего сервера:", color=discord.Color.gold())
 
     for index, (uid, liters_count) in enumerate(top_users_list, 1):
         if index == 1: medal = "🥇"
@@ -103,9 +127,10 @@ async def leaderboard(interaction: discord.Interaction):
 # --- КОМАНДА /STATS ---
 @bot.tree.command(name="stats", description="Посмотреть свою личную статистику")
 async def stats(interaction: discord.Interaction):
-    user_id = interaction.user.id
-    guild_id = interaction.guild_id
-    
+    global conn, cursor
+    if conn.closed != 0:
+        conn, cursor = connect_to_db()
+
     cursor.execute("SELECT liters FROM users WHERE user_id = %s AND guild_id = %s", (user_id, guild_id))
     result = cursor.fetchone()
     liters_count = result[0] if result else 0.0
@@ -114,18 +139,17 @@ async def stats(interaction: discord.Interaction):
     if interaction.user.avatar: embed.set_thumbnail(url=interaction.user.avatar.url)
         
     if liters_count == 0: status = "Трезвенник 🥱"
-    elif liters_count < 5.0: status = "Школота 🥂"
-    elif liters_count < 15.0: status = "Любитель тусовок 🍺"
-    elif liters_count < 30.0: status = "Алкашня 🥃"
+    elif liters_count < 50.0: status = "Школота 🥂"
+    elif liters_count < 100.0: status = "Любитель тусовок 🍺"
+    elif liters_count < 200.0: status = "Алкашня 🥃"
     else: status = "Легенда 👑"
         
     embed.add_field(name="Выпито алкоголя:", value=f"**{liters_count} л.**", inline=True)
     embed.add_field(name="Твой статус:", value=f"*{status}*", inline=True)
     
-    if liters_count == 0: embed.set_footer(text="Бармен ждет твоего заказа! Используй /drink")
+    if liters_count == 0: embed.set_footer(text="Используй /drink")
     else: embed.set_footer(text="Чем выше статус, тем больше литров ты пьешь за раз!")
 
     await interaction.response.send_message(embed=embed)
 
-# ЗАПУСК БОТА С ТОКЕНОМ ИЗ НАСТРОЕК
 bot.run(os.getenv('TOKEN'))
