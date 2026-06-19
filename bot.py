@@ -61,7 +61,7 @@ DRINKS = [
 
 # --- КОМАНДА /DRINK ---
 @bot.tree.command(name="drink", description="Выпить алкоголь")
-# @app_commands.checks.cooldown(1, 3600.0, key=lambda i: (i.guild_id, i.user.id))
+@app_commands.checks.cooldown(1, 3600.0, key=lambda i: (i.guild_id, i.user.id))
 async def drink(interaction: discord.Interaction):
     user_id = interaction.user.id
     guild_id = interaction.guild_id
