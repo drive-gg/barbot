@@ -35,8 +35,7 @@ class MyBot(commands.Bot):
         self.keep_db_alive.start() # Запускаем наш "Пульс" при старте бота
         print("Слеш-команды успешно синхронизированы и БД под контролем!")
 
-    # --- ТОТ САМЫЙ "ПУЛЬС" ---
-    # Каждые 3 минуты бот будет пинговать базу, чтобы она не уснула
+    # --- ПУЛЬС ДЛЯ ПОДДЕРЖАНИЯ ЖИЗНИ БД ---
     @tasks.loop(minutes=3.0)
     async def keep_db_alive(self):
         global conn, cursor
@@ -68,7 +67,6 @@ async def drink(interaction: discord.Interaction):
     
     drink_choice = random.choice(DRINKS)
     
-    # Перед каждым запросом проверяем, живо ли соединение (на всякий случай)
     global conn, cursor
     if conn.closed != 0:
         conn, cursor = connect_to_db()
@@ -90,13 +88,13 @@ async def drink(interaction: discord.Interaction):
     else:
         cursor.execute("UPDATE users SET liters = %s WHERE user_id = %s AND guild_id = %s", (new_total, user_id, guild_id))
     
-    await interaction.response.send_message(f"**{interaction.user.name}** {drink_choice} выпивает залпом **{added_liters} л.**! 🥂\n*(Всего выпито: {new_total} л.)*")
+    await interaction.response.send_message(f"**{interaction.user.name}**{drink_choice} выпивает залпом **{added_liters} л.**! 🥂\n*(Всего выпито: {new_total} л.)*")
 
 @drink.error
 async def drink_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CommandOnCooldown):
         minutes = int(error.retry_after / 60)
-        await interaction.response.send_message(f"🛑 Приходи через {minutes} минут.", ephemeral=True)
+        await interaction.response.send_message(f"🛑Приходи через {minutes} минут.", ephemeral=True)
 
 # --- КОМАНДА /LEADERBOARD ---
 @bot.tree.command(name="leaderboard", description="Показать список лидеров")
@@ -112,7 +110,7 @@ async def leaderboard(interaction: discord.Interaction):
         await interaction.response.send_message("🍺 Будь первым, используй /drink")
         return
 
-    embed = discord.Embed(title="🏆 Топ посетителей бара", description="Самые стойкие участники нашего сервера:", color=discord.Color.gold())
+    embed = discord.Embed(title="🏆 Топ", description="Самые стойкие участники нашего сервера:", color=discord.Color.gold())
 
     for index, (uid, liters_count) in enumerate(top_users_list, 1):
         if index == 1: medal = "🥇"
@@ -124,9 +122,12 @@ async def leaderboard(interaction: discord.Interaction):
         
     await interaction.response.send_message(embed=embed)
 
-# --- КОМАНДА /STATS ---
+# --- КОМАНДА /STATS (ТЕПЕРЬ ИСПРАВЛЕНА) ---
 @bot.tree.command(name="stats", description="Посмотреть свою личную статистику")
 async def stats(interaction: discord.Interaction):
+    user_id = interaction.user.id   
+    guild_id = interaction.guild_id
+    
     global conn, cursor
     if conn.closed != 0:
         conn, cursor = connect_to_db()
@@ -139,8 +140,8 @@ async def stats(interaction: discord.Interaction):
     if interaction.user.avatar: embed.set_thumbnail(url=interaction.user.avatar.url)
         
     if liters_count == 0: status = "Трезвенник 🥱"
-    elif liters_count < 50.0: status = "Школота 🥂"
-    elif liters_count < 100.0: status = "Любитель тусовок 🍺"
+    elif liters_count < 50.0: status = "Школота🥂"
+    elif liters_count < 150.0: status = "Любитель тусовок 🍺"
     elif liters_count < 200.0: status = "Алкашня 🥃"
     else: status = "Легенда 👑"
         
